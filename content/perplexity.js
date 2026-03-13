@@ -1,21 +1,17 @@
 // AI Panel - Perplexity Content Script
+// Fixed: input injection + send button selector
 
 (function() {
   'use strict';
 
   const AI_TYPE = 'perplexity';
 
-  // Check if extension context is still valid
   function isContextValid() {
     return chrome.runtime && chrome.runtime.id;
   }
 
-  // Safe message sender that checks context first
   function safeSendMessage(message, callback) {
-    if (!isContextValid()) {
-      console.log('[AI Panel] Extension context invalidated, skipping message');
-      return;
-    }
+    if (!isContextValid()) return;
     try {
       chrome.runtime.sendMessage(message, callback);
     } catch (e) {
@@ -23,10 +19,8 @@
     }
   }
 
-  // Notify background that content script is ready
   safeSendMessage({ type: 'CONTENT_SCRIPT_READY', aiType: AI_TYPE });
 
-  // Listen for messages from background script
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'INJECT_MESSAGE') {
       injectMessage(message.message)
@@ -34,160 +28,190 @@
         .catch(err => sendResponse({ success: false, error: err.message }));
       return true;
     }
-
     if (message.type === 'INJECT_FILES') {
-      console.log('[AI Panel] Perplexity received INJECT_FILES message, files:', message.files?.length);
       injectFiles(message.files)
-        .then(() => {
-          console.log('[AI Panel] Perplexity injectFiles completed successfully');
-          sendResponse({ success: true });
-        })
-        .catch(err => {
-          console.log('[AI Panel] Perplexity injectFiles failed:', err.message);
-          sendResponse({ success: false, error: err.message });
-        });
+        .then(() => sendResponse({ success: true }))
+        .catch(err => sendResponse({ success: false, error: err.message }));
       return true;
     }
-
     if (message.type === 'GET_LATEST_RESPONSE') {
-      const response = getLatestResponse();
-      sendResponse({ content: response });
+      sendResponse({ content: getLatestResponse() });
       return true;
     }
   });
 
-  // Setup response observer for cross-reference feature
   setupResponseObserver();
 
+  // ─── Input Injection ───────────────────────────────────────────────
   async function injectMessage(text) {
-    // Perplexity uses a textarea for input
-    const inputSelectors = [
-      'textarea[placeholder]',
-      'textarea',
-      'div[contenteditable="true"]'
-    ];
+    // Perplexity uses a contenteditable div (not a real textarea)
+    // The actual editable area is: div[contenteditable="true"] inside the input container
+    // We must exclude the "Computer" tool panel which is also contenteditable sometimes
 
-    let inputEl = null;
-    for (const selector of inputSelectors) {
-      const candidates = document.querySelectorAll(selector);
-      for (const el of candidates) {
-        if (isVisible(el)) {
-          inputEl = el;
-          break;
-        }
-      }
-      if (inputEl) break;
-    }
+    const inputEl = findInputElement();
+    if (!inputEl) throw new Error('Could not find Perplexity input field');
 
-    if (!inputEl) {
-      throw new Error('Could not find Perplexity input field');
-    }
-
-    // Focus the input
     inputEl.focus();
 
-    // Set the value using native setter to trigger React state update
-    const proto = Object.getPrototypeOf(inputEl);
-    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
-    if (descriptor && descriptor.set) {
-      descriptor.set.call(inputEl, text);
-    } else {
-      inputEl.value = text;
+    // Clear existing content
+    inputEl.innerHTML = '';
+    await sleep(50);
+
+    // Use execCommand to insert text (works with React contenteditable)
+    document.execCommand('selectAll', false, null);
+    document.execCommand('delete', false, null);
+    document.execCommand('insertText', false, text);
+
+    // Fallback: if execCommand didn't work, set directly
+    if (!inputEl.textContent.trim()) {
+      inputEl.textContent = text;
+      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
-    // Dispatch events to trigger React/framework update
-    inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-    inputEl.dispatchEvent(new Event('change', { bubbles: true }));
-
-    // Small delay to let the UI process
     await sleep(200);
 
-    // Find and click the send button
-    const sendButton = findSendButton();
+    const sendButton = findSendButton(inputEl);
     if (!sendButton) {
-      // Fallback: press Enter
+      // Last resort: press Enter
       inputEl.dispatchEvent(new KeyboardEvent('keydown', {
-        key: 'Enter',
-        code: 'Enter',
-        keyCode: 13,
-        bubbles: true
+        key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true
       }));
-      console.log('[AI Panel] Perplexity: no send button found, used Enter key');
+      console.log('[AI Panel] Perplexity: used Enter key fallback');
     } else {
       await waitForButtonEnabled(sendButton);
       sendButton.click();
+      console.log('[AI Panel] Perplexity: clicked send button');
     }
 
-    console.log('[AI Panel] Perplexity message sent, starting response capture...');
     waitForStreamingComplete();
     return true;
   }
 
-  function findSendButton() {
-    const selectors = [
-      'button[aria-label*="Submit"]',
-      'button[aria-label*="Send"]',
-      'button[type="submit"]',
-      'button svg[data-icon="arrow-right"]',
-      'button svg[data-icon="paper-plane"]'
-    ];
+  function findInputElement() {
+    // Strategy 1: The main search/chat textarea - Perplexity uses a div[contenteditable]
+    // Look for contenteditable that is NOT inside a tool panel
+    const allEditable = document.querySelectorAll('div[contenteditable="true"]');
+    for (const el of allEditable) {
+      if (!isVisible(el)) continue;
+      // Skip elements that are tiny (toolbar items etc)
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 100 || rect.height < 20) continue;
+      // Skip if it's inside a dropdown/modal that appeared from Computer button
+      const isInModal = el.closest('[role="dialog"], [role="menu"], .fixed');
+      if (isInModal) continue;
+      return el;
+    }
 
-    for (const selector of selectors) {
-      const el = document.querySelector(selector);
-      if (el && isVisible(el)) {
-        return el.closest('button') || el;
+    // Strategy 2: textarea (older Perplexity UI)
+    const textarea = document.querySelector('textarea');
+    if (textarea && isVisible(textarea)) return textarea;
+
+    return null;
+  }
+
+  function findSendButton(inputEl) {
+    // Strategy 1: aria-label containing submit/send
+    const ariaSelectors = [
+      'button[aria-label="Submit"]',
+      'button[aria-label="submit"]',
+      'button[aria-label="Send"]',
+      'button[aria-label="send"]',
+      'button[aria-label*="Send message"]',
+      'button[aria-label*="Submit query"]',
+    ];
+    for (const sel of ariaSelectors) {
+      const btn = document.querySelector(sel);
+      if (btn && isVisible(btn)) return btn;
+    }
+
+    // Strategy 2: find the button INSIDE the same input container as inputEl
+    // that has a right-arrow / send SVG icon
+    if (inputEl) {
+      // Walk up to find the input wrapper
+      let container = inputEl.parentElement;
+      for (let i = 0; i < 6; i++) {
+        if (!container) break;
+        const buttons = container.querySelectorAll('button');
+        for (const btn of [...buttons].reverse()) {
+          if (!isVisible(btn)) continue;
+          // Exclude buttons known to NOT be send (Computer, mic, attach, plus)
+          const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+          if (
+            label.includes('computer') ||
+            label.includes('microphone') ||
+            label.includes('mic') ||
+            label.includes('attach') ||
+            label.includes('upload') ||
+            label.includes('model') ||
+            label.includes('plus') ||
+            label.includes('add')
+          ) continue;
+
+          // Prefer buttons with a right-pointing arrow SVG (send icon)
+          const svgPath = btn.querySelector('svg path, svg polyline, svg line');
+          if (svgPath) return btn;
+        }
+        container = container.parentElement;
       }
     }
 
-    // Fallback: find a button near the textarea
-    const buttons = document.querySelectorAll('button');
-    for (const btn of [...buttons].reverse()) {
+    // Strategy 3: last enabled button near bottom of viewport
+    const allButtons = [...document.querySelectorAll('button')];
+    const bottomButtons = allButtons.filter(btn => {
+      if (!isVisible(btn) || btn.disabled) return false;
       const rect = btn.getBoundingClientRect();
-      if (rect.bottom > window.innerHeight - 200 && isVisible(btn) && !btn.disabled) {
-        if (btn.querySelector('svg')) {
-          return btn;
-        }
-      }
+      return rect.bottom > window.innerHeight - 200 && rect.top > 0;
+    });
+
+    // Among bottom buttons, prefer the rightmost one that has an SVG and no harmful label
+    const candidates = bottomButtons.filter(btn => {
+      const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+      return (
+        !label.includes('computer') &&
+        !label.includes('mic') &&
+        !label.includes('attach') &&
+        !label.includes('model') &&
+        btn.querySelector('svg')
+      );
+    });
+    if (candidates.length > 0) {
+      // Return rightmost
+      return candidates.reduce((a, b) => {
+        return a.getBoundingClientRect().right > b.getBoundingClientRect().right ? a : b;
+      });
     }
 
     return null;
   }
 
-  async function waitForButtonEnabled(button, maxWait = 2000) {
+  async function waitForButtonEnabled(button, maxWait = 3000) {
     const start = Date.now();
     while (button.disabled && Date.now() - start < maxWait) {
       await sleep(50);
     }
   }
 
+  // ─── Response Observer ─────────────────────────────────────────────
   function setupResponseObserver() {
     const observer = new MutationObserver((mutations) => {
-      if (!isContextValid()) {
-        observer.disconnect();
-        return;
-      }
+      if (!isContextValid()) { observer.disconnect(); return; }
       for (const mutation of mutations) {
         if (mutation.type === 'childList') {
           for (const node of mutation.addedNodes) {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              checkForResponse(node);
-            }
+            if (node.nodeType === Node.ELEMENT_NODE) checkForResponse(node);
           }
         }
       }
     });
-
-    const startObserving = () => {
+    const start = () => {
       if (!isContextValid()) return;
-      const mainContent = document.querySelector('main') || document.body;
-      observer.observe(mainContent, { childList: true, subtree: true });
+      observer.observe(document.querySelector('main') || document.body, {
+        childList: true, subtree: true
+      });
     };
-
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', startObserving);
-    } else {
-      startObserving();
-    }
+    document.readyState === 'loading'
+      ? document.addEventListener('DOMContentLoaded', start)
+      : start();
   }
 
   let lastCapturedContent = '';
@@ -195,57 +219,40 @@
 
   function checkForResponse(node) {
     if (isCapturing) return;
-    // Perplexity response containers
-    const isResponse =
-      node.matches?.('[data-testid="answer"], .prose, [class*="answer"]') ||
-      node.querySelector?.('[data-testid="answer"], .prose, [class*="answer"]');
-
-    if (isResponse) {
-      console.log('[AI Panel] Perplexity detected new response, waiting for completion...');
+    const hit =
+      node.matches?.('.prose, [class*="answer"], [data-testid*="answer"]') ||
+      node.querySelector?.('.prose, [class*="answer"], [data-testid*="answer"]');
+    if (hit) {
+      console.log('[AI Panel] Perplexity: new response detected');
       waitForStreamingComplete();
     }
   }
 
   async function waitForStreamingComplete() {
-    if (isCapturing) {
-      console.log('[AI Panel] Perplexity already capturing, skipping...');
-      return;
-    }
+    if (isCapturing) return;
     isCapturing = true;
-
-    let previousContent = '';
+    let prev = '';
     let stableCount = 0;
-    const maxWait = 600000; // 10 minutes
-    const checkInterval = 500;
-    const stableThreshold = 4; // 2 seconds stable
-    const startTime = Date.now();
-
+    const start = Date.now();
     try {
-      while (Date.now() - startTime < maxWait) {
-        if (!isContextValid()) {
-          console.log('[AI Panel] Context invalidated, stopping capture');
-          return;
-        }
-        await sleep(checkInterval);
-        const currentContent = getLatestResponse() || '';
-        if (currentContent === previousContent && currentContent.length > 0) {
+      while (Date.now() - start < 600000) {
+        if (!isContextValid()) return;
+        await sleep(500);
+        const cur = getLatestResponse() || '';
+        if (cur === prev && cur.length > 0) {
           stableCount++;
-          if (stableCount >= stableThreshold) {
-            if (currentContent !== lastCapturedContent) {
-              lastCapturedContent = currentContent;
-              safeSendMessage({
-                type: 'RESPONSE_CAPTURED',
-                aiType: AI_TYPE,
-                content: currentContent
-              });
-              console.log('[AI Panel] Perplexity response captured, length:', currentContent.length);
+          if (stableCount >= 4) {
+            if (cur !== lastCapturedContent) {
+              lastCapturedContent = cur;
+              safeSendMessage({ type: 'RESPONSE_CAPTURED', aiType: AI_TYPE, content: cur });
+              console.log('[AI Panel] Perplexity response captured, length:', cur.length);
             }
             return;
           }
         } else {
           stableCount = 0;
         }
-        previousContent = currentContent;
+        prev = cur;
       }
     } finally {
       isCapturing = false;
@@ -253,96 +260,63 @@
   }
 
   function getLatestResponse() {
-    // Try Perplexity-specific answer containers
+    // Perplexity answer selectors (in priority order)
     const selectors = [
+      '[data-testid="answer-text"]',
       '[data-testid="answer"]',
       '.prose',
       '[class*="answerContent"]',
       '[class*="answer"]'
     ];
-
-    for (const selector of selectors) {
-      const elements = document.querySelectorAll(selector);
-      if (elements.length > 0) {
-        const last = elements[elements.length - 1];
-        const content = last.innerText?.trim();
-        if (content && content.length > 10) {
-          console.log('[AI Panel] Perplexity response found via', selector, ', length:', content.length);
-          return content;
-        }
+    for (const sel of selectors) {
+      const els = document.querySelectorAll(sel);
+      if (els.length > 0) {
+        const last = els[els.length - 1];
+        const text = last.innerText?.trim();
+        if (text && text.length > 10) return text;
       }
     }
-
-    console.log('[AI Panel] Perplexity: no response found');
     return null;
   }
 
-  // File injection for Perplexity
+  // ─── File Upload ───────────────────────────────────────────────────
   async function injectFiles(filesData) {
-    console.log('[AI Panel] Perplexity injecting files:', filesData.length);
-
-    const files = filesData.map(fileData => {
-      const byteCharacters = atob(fileData.base64);
-      const byteNumbers = new Array(byteCharacters.length);
-      for (let i = 0; i < byteCharacters.length; i++) {
-        byteNumbers[i] = byteCharacters.charCodeAt(i);
-      }
-      const byteArray = new Uint8Array(byteNumbers);
-      const blob = new Blob([byteArray], { type: fileData.type });
-      return new File([blob], fileData.name, { type: fileData.type });
+    const files = filesData.map(fd => {
+      const bytes = atob(fd.base64);
+      const arr = new Uint8Array(bytes.length);
+      for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+      return new File([arr], fd.name, { type: fd.type });
     });
 
-    const fileInputs = document.querySelectorAll('input[type="file"]');
-    console.log('[AI Panel] Perplexity found', fileInputs.length, 'file inputs');
-
-    if (fileInputs.length === 0) {
-      const uploadSelectors = [
-        'button[aria-label*="Upload"]',
-        'button[aria-label*="Attach"]',
-        'button[aria-label*="file"]',
-        'label[for*="file"]'
-      ];
-      for (const selector of uploadSelectors) {
-        const btn = document.querySelector(selector);
-        if (btn && isVisible(btn)) {
-          btn.click();
-          await sleep(500);
-          break;
-        }
+    let inputs = document.querySelectorAll('input[type="file"]');
+    if (inputs.length === 0) {
+      for (const sel of ['button[aria-label*="Attach"]', 'button[aria-label*="Upload"]']) {
+        const btn = document.querySelector(sel);
+        if (btn && isVisible(btn)) { btn.click(); await sleep(500); break; }
       }
+      inputs = document.querySelectorAll('input[type="file"]');
     }
-
-    const allInputs = document.querySelectorAll('input[type="file"]');
-    for (const fileInput of allInputs) {
+    for (const inp of inputs) {
       try {
-        const dataTransfer = new DataTransfer();
-        files.forEach(file => dataTransfer.items.add(file));
-        fileInput.files = dataTransfer.files;
-        fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-        fileInput.dispatchEvent(new Event('input', { bubbles: true }));
-        console.log('[AI Panel] Perplexity files set on input');
+        const dt = new DataTransfer();
+        files.forEach(f => dt.items.add(f));
+        inp.files = dt.files;
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
         await sleep(1000);
         return true;
-      } catch (e) {
-        console.log('[AI Panel] Perplexity input injection error:', e.message);
-      }
+      } catch (e) { console.log('[AI Panel] file inject error:', e.message); }
     }
-
-    throw new Error('Perplexity 暂不支持自动文件上传，请手动上传文件');
+    throw new Error('Perplexity 暂不支持自动文件上传，请手动上传');
   }
 
-  // Utility functions
-  function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
+  // ─── Utils ─────────────────────────────────────────────────────────
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
   function isVisible(el) {
     if (!el) return false;
-    const style = window.getComputedStyle(el);
-    return style.display !== 'none' &&
-      style.visibility !== 'hidden' &&
-      style.opacity !== '0';
+    const s = window.getComputedStyle(el);
+    return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
   }
 
-  console.log('[AI Panel] Perplexity content script loaded');
+  console.log('[AI Panel] Perplexity content script loaded (v2)');
 })();
