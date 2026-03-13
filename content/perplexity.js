@@ -184,7 +184,7 @@
     return null;
   }
 
-  async function waitForButtonEnabled(button, maxWait = 3000) {
+  async function waitForButtonEnabled(button, maxWait = 5000) {
     const start = Date.now();
     while (button.disabled && Date.now() - start < maxWait) {
       await sleep(50);
