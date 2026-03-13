@@ -43,6 +43,7 @@
   setupResponseObserver();
 
   // ─── Input Injection ───────────────────────────────────────────────
+
   async function injectMessage(text) {
     // Perplexity uses a contenteditable div (not a real textarea)
     // The actual editable area is: div[contenteditable="true"] inside the input container
@@ -72,8 +73,11 @@
 
     const sendButton = findSendButton(inputEl);
     if (!sendButton) {
-      // Last resort: press Enter
+      // Last resort: press Enter with keydown and keyup
       inputEl.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true
+      }));
+      inputEl.dispatchEvent(new KeyboardEvent('keyup', {
         key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true
       }));
       console.log('[AI Panel] Perplexity: used Enter key fallback');
@@ -93,12 +97,15 @@
     const allEditable = document.querySelectorAll('div[contenteditable="true"]');
     for (const el of allEditable) {
       if (!isVisible(el)) continue;
+
       // Skip elements that are tiny (toolbar items etc)
       const rect = el.getBoundingClientRect();
       if (rect.width < 100 || rect.height < 20) continue;
+
       // Skip if it's inside a dropdown/modal that appeared from Computer button
       const isInModal = el.closest('[role="dialog"], [role="menu"], .fixed');
       if (isInModal) continue;
+
       return el;
     }
 
@@ -110,8 +117,9 @@
   }
 
   function findSendButton(inputEl) {
-    // Strategy 1: aria-label containing submit/send
+    // Strategy 1: aria-label containing submit/send (prioritize Chinese 提交)
     const ariaSelectors = [
+      'button[aria-label="提交"]',  // Chinese submit
       'button[aria-label="Submit"]',
       'button[aria-label="submit"]',
       'button[aria-label="Send"]',
@@ -119,6 +127,7 @@
       'button[aria-label*="Send message"]',
       'button[aria-label*="Submit query"]',
     ];
+
     for (const sel of ariaSelectors) {
       const btn = document.querySelector(sel);
       if (btn && isVisible(btn)) return btn;
@@ -134,7 +143,8 @@
         const buttons = container.querySelectorAll('button');
         for (const btn of [...buttons].reverse()) {
           if (!isVisible(btn)) continue;
-          // Exclude buttons known to NOT be send (Computer, mic, attach, plus)
+
+          // Exclude buttons known to NOT be send (Computer, mic, attach, plus, Chinese labels)
           const label = (btn.getAttribute('aria-label') || '').toLowerCase();
           if (
             label.includes('computer') ||
@@ -144,7 +154,10 @@
             label.includes('upload') ||
             label.includes('model') ||
             label.includes('plus') ||
-            label.includes('add')
+            label.includes('add') ||
+            label.includes('模型') ||  // Chinese: model
+            label.includes('麦克风') ||  // Chinese: microphone
+            label.includes('通知')  // Chinese: notification
           ) continue;
 
           // Prefer buttons with a right-pointing arrow SVG (send icon)
@@ -171,9 +184,13 @@
         !label.includes('mic') &&
         !label.includes('attach') &&
         !label.includes('model') &&
+        !label.includes('模型') &&
+        !label.includes('麦克风') &&
+        !label.includes('通知') &&
         btn.querySelector('svg')
       );
     });
+
     if (candidates.length > 0) {
       // Return rightmost
       return candidates.reduce((a, b) => {
@@ -192,9 +209,13 @@
   }
 
   // ─── Response Observer ─────────────────────────────────────────────
+
   function setupResponseObserver() {
     const observer = new MutationObserver((mutations) => {
-      if (!isContextValid()) { observer.disconnect(); return; }
+      if (!isContextValid()) {
+        observer.disconnect();
+        return;
+      }
       for (const mutation of mutations) {
         if (mutation.type === 'childList') {
           for (const node of mutation.addedNodes) {
@@ -203,12 +224,15 @@
         }
       }
     });
+
     const start = () => {
       if (!isContextValid()) return;
       observer.observe(document.querySelector('main') || document.body, {
-        childList: true, subtree: true
+        childList: true,
+        subtree: true
       });
     };
+
     document.readyState === 'loading'
       ? document.addEventListener('DOMContentLoaded', start)
       : start();
@@ -219,9 +243,8 @@
 
   function checkForResponse(node) {
     if (isCapturing) return;
-    const hit =
-      node.matches?.('.prose, [class*="answer"], [data-testid*="answer"]') ||
-      node.querySelector?.('.prose, [class*="answer"], [data-testid*="answer"]');
+    const hit = node.matches?.('.prose, [class*="answer"], [data-testid*="answer"]') ||
+                node.querySelector?.('.prose, [class*="answer"], [data-testid*="answer"]');
     if (hit) {
       console.log('[AI Panel] Perplexity: new response detected');
       waitForStreamingComplete();
@@ -231,20 +254,27 @@
   async function waitForStreamingComplete() {
     if (isCapturing) return;
     isCapturing = true;
+
     let prev = '';
     let stableCount = 0;
     const start = Date.now();
+
     try {
       while (Date.now() - start < 600000) {
         if (!isContextValid()) return;
         await sleep(500);
         const cur = getLatestResponse() || '';
+
         if (cur === prev && cur.length > 0) {
           stableCount++;
           if (stableCount >= 4) {
             if (cur !== lastCapturedContent) {
               lastCapturedContent = cur;
-              safeSendMessage({ type: 'RESPONSE_CAPTURED', aiType: AI_TYPE, content: cur });
+              safeSendMessage({
+                type: 'RESPONSE_CAPTURED',
+                aiType: AI_TYPE,
+                content: cur
+              });
               console.log('[AI Panel] Perplexity response captured, length:', cur.length);
             }
             return;
@@ -268,6 +298,7 @@
       '[class*="answerContent"]',
       '[class*="answer"]'
     ];
+
     for (const sel of selectors) {
       const els = document.querySelectorAll(sel);
       if (els.length > 0) {
@@ -276,10 +307,12 @@
         if (text && text.length > 10) return text;
       }
     }
+
     return null;
   }
 
   // ─── File Upload ───────────────────────────────────────────────────
+
   async function injectFiles(filesData) {
     const files = filesData.map(fd => {
       const bytes = atob(fd.base64);
@@ -292,10 +325,15 @@
     if (inputs.length === 0) {
       for (const sel of ['button[aria-label*="Attach"]', 'button[aria-label*="Upload"]']) {
         const btn = document.querySelector(sel);
-        if (btn && isVisible(btn)) { btn.click(); await sleep(500); break; }
+        if (btn && isVisible(btn)) {
+          btn.click();
+          await sleep(500);
+          break;
+        }
       }
       inputs = document.querySelectorAll('input[type="file"]');
     }
+
     for (const inp of inputs) {
       try {
         const dt = new DataTransfer();
@@ -304,13 +342,19 @@
         inp.dispatchEvent(new Event('change', { bubbles: true }));
         await sleep(1000);
         return true;
-      } catch (e) { console.log('[AI Panel] file inject error:', e.message); }
+      } catch (e) {
+        console.log('[AI Panel] file inject error:', e.message);
+      }
     }
+
     throw new Error('Perplexity 暂不支持自动文件上传，请手动上传');
   }
 
   // ─── Utils ─────────────────────────────────────────────────────────
-  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function sleep(ms) {
+    return new Promise(r => setTimeout(r, ms));
+  }
 
   function isVisible(el) {
     if (!el) return false;
