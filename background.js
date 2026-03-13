@@ -4,13 +4,14 @@
 const AI_URL_PATTERNS = {
   claude: ['claude.ai'],
   chatgpt: ['chat.openai.com', 'chatgpt.com'],
-  gemini: ['gemini.google.com']
+  gemini: ['gemini.google.com'],
+  perplexity: ['perplexity.ai']
 };
 
 // Store latest responses using chrome.storage.session (persists across service worker restarts)
 async function getStoredResponses() {
   const result = await chrome.storage.session.get('latestResponses');
-  return result.latestResponses || { claude: null, chatgpt: null, gemini: null };
+  return result.latestResponses || { claude: null, chatgpt: null, gemini: null, perplexity: null };
 }
 
 async function setStoredResponse(aiType, content) {
@@ -73,12 +74,8 @@ async function getResponseFromContentScript(aiType) {
       const responses = await getStoredResponses();
       return { content: responses[aiType] };
     }
-
     // Query content script for real-time DOM content
-    const response = await chrome.tabs.sendMessage(tab.id, {
-      type: 'GET_LATEST_RESPONSE'
-    });
-
+    const response = await chrome.tabs.sendMessage(tab.id, { type: 'GET_LATEST_RESPONSE' });
     return { content: response?.content || null };
   } catch (err) {
     // Fallback to stored response on error
@@ -92,24 +89,13 @@ async function sendMessageToAI(aiType, message) {
   try {
     // Find the tab for this AI
     const tab = await findAITab(aiType);
-
     if (!tab) {
       return { success: false, error: `No ${aiType} tab found` };
     }
-
     // Send message to content script
-    const response = await chrome.tabs.sendMessage(tab.id, {
-      type: 'INJECT_MESSAGE',
-      message
-    });
-
+    const response = await chrome.tabs.sendMessage(tab.id, { type: 'INJECT_MESSAGE', message });
     // Notify side panel
-    notifySidePanel('SEND_RESULT', {
-      aiType,
-      success: response?.success,
-      error: response?.error
-    });
-
+    notifySidePanel('SEND_RESULT', { aiType, success: response?.success, error: response?.error });
     return response;
   } catch (err) {
     return { success: false, error: err.message };
@@ -120,19 +106,13 @@ async function sendFilesToAI(aiType, files) {
   console.log('[AI Panel] Background: sendFilesToAI called for', aiType, 'files:', files?.length);
   try {
     const tab = await findAITab(aiType);
-
     if (!tab) {
       console.log('[AI Panel] Background: No tab found for', aiType);
       return { success: false, error: `No ${aiType} tab found` };
     }
-
     console.log('[AI Panel] Background: Sending INJECT_FILES to tab', tab.id);
     // Send files to content script
-    const response = await chrome.tabs.sendMessage(tab.id, {
-      type: 'INJECT_FILES',
-      files
-    });
-
+    const response = await chrome.tabs.sendMessage(tab.id, { type: 'INJECT_FILES', files });
     console.log('[AI Panel] Background: Response from content script:', response);
     return response;
   } catch (err) {
@@ -144,15 +124,12 @@ async function sendFilesToAI(aiType, files) {
 async function findAITab(aiType) {
   const patterns = AI_URL_PATTERNS[aiType];
   if (!patterns) return null;
-
   const tabs = await chrome.tabs.query({});
-
   for (const tab of tabs) {
     if (tab.url && patterns.some(p => tab.url.includes(p))) {
       return tab;
     }
   }
-
   return null;
 }
 
